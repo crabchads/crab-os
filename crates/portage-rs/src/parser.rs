@@ -1,162 +1,298 @@
-use winnow::{
-	ModalResult, Parser,
-	ascii::{alpha1, digit1},
-	combinator::{alt, opt, repeat},
-	error::StrContext,
-	token::take_while,
-};
+use logos::{Logos, Span as LogosSpan};
+
+#[derive(Logos, Debug, PartialEq)]
+#[logos(skip r"[ \t\n\f]+")]
+pub enum PackageVersionToken {
+	#[regex(r"[0-9]+(\.[0-9]+)*")]
+	Number,
+
+	#[regex(r"[a-z]")]
+	Letter,
+
+	#[token("_alpha")]
+	AlphaSuffix,
+
+	#[token("_beta")]
+	BetaSuffix,
+
+	#[token("_pre")]
+	PreSuffix,
+
+	#[token("_rc")]
+	RcSuffix,
+
+	#[token("_p")]
+	PatchSuffix,
+
+	#[token("-r")]
+	RevisionPrefix,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Span {
+	pub start: usize,
+	pub end: usize,
+}
+
+impl From<LogosSpan> for Span {
+	fn from(s: LogosSpan) -> Self {
+		Span {
+			start: s.start,
+			end: s.end,
+		}
+	}
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackageSpecifier {
-	pub version_selector: Option<String>,
-	pub category: String,
-	pub name: String,
-	pub version: Option<String>,
-}
-
-impl From<&str> for PackageSpecifier {
-	fn from(input: &str) -> Self {
-		let mut input = input;
-		package_specifier(&mut input).unwrap_or_else(|err| {
-			panic!("Failed to parse package specifier: {err}: {input}");
-		})
-	}
+	pub version_selector: Option<(String, Span)>,
+	pub category: (String, Span),
+	pub name: (String, Span),
+	pub version: Option<(String, Span)>,
 }
 
 impl std::fmt::Display for PackageSpecifier {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		if self.version_selector.is_some() {
-			write!(f, "{}-", self.version_selector.as_ref().unwrap())?;
+		if let Some((ref sel, _)) = self.version_selector {
+			write!(f, "{sel}-")?;
 		}
-
-		write!(f, "{}/{}", self.category, self.name)?;
-		if let Some(ref version) = self.version {
+		write!(f, "{}/{}", self.category.0, self.name.0)?;
+		if let Some((ref version, _)) = self.version {
 			write!(f, "-{version}")?;
 		}
 		Ok(())
 	}
 }
 
-/// Parse a package version
-pub fn package_version(input: &mut &str) -> ModalResult<String> {
-	// A version starts with the number part, which is in the form [0-9]+(\.[0-9]+)* (an unsigned integer, followed by zero or more dot-prefixed unsigned integers).
-	// This may optionally be followed by one of [a-z] (a lower-case letter).
-	// This may be followed by zero or more of the suffixes _alpha, _beta, _pre, _rc or _p, each of which may optionally be followed by an unsigned integer.
-	// Suffix and integer count as separate version components.
-	// This may optionally be followed by the suffix -r followed immediately by an unsigned integer (the “revision number”). If this suffix is not present, it is assumed to be -r0.
+#[derive(Logos, Debug, PartialEq, Copy, Clone)]
+#[logos(skip r"[ \t\n\f]+")]
+pub enum SpecToken {
+	// Version selectors
+	#[token(">=")]
+	Ge,
+	#[token("<=")]
+	Le,
+	#[token(">")]
+	Gt,
+	#[token("<")]
+	Lt,
+	#[token("=")]
+	Eq,
+	#[token("==")]
+	EqEq,
+	#[token("~=")]
+	TildeEq,
 
-	(
-		digit1,
-		repeat(0.., (".", digit1).map(|(_, num)| num)),
-		opt(alpha1),
-		repeat(
-			0..,
-			alt(("_alpha", "_beta", "_pre", "_rc", "_p"))
-				.context(StrContext::Label("suffix")),
-		)
-		.context(StrContext::Label("suffixes")),
-		repeat(0.., ("-r", digit1).map(|(_prefix, num)| num)),
-	)
-		.context(StrContext::Label("package version"))
-		.map(
-			|(major, minor, letter, suffixes, revision): (
-				&str,
-				Vec<&str>,
-				Option<&str>,
-				Vec<&str>,
-				Vec<&str>,
-			)| {
-				let mut version = major.to_string();
+	// Category/Name
+	#[regex(r"[A-Za-z0-9._+-]+", priority = 3)]
+	Ident,
 
-				if !minor.is_empty() {
-					version.push('.');
-					version.push_str(&minor.join("."));
-				}
+	#[token("/")]
+	Slash,
 
-				if let Some(letter) = letter {
-					version.push_str(letter);
-				}
+	// Version
+	#[regex(r"[0-9]+(\.[0-9]+)*")]
+	Number,
+	#[regex(r"[a-z]")]
+	Letter,
+	#[token("_alpha")]
+	AlphaSuffix,
+	#[token("_beta")]
+	BetaSuffix,
+	#[token("_pre")]
+	PreSuffix,
+	#[token("_rc")]
+	RcSuffix,
+	#[token("_p")]
+	PatchSuffix,
+	#[token("-r")]
+	RevisionPrefix,
 
-				for suffix in suffixes {
-					version.push_str(suffix);
-				}
-
-				for rev in revision {
-					version.push_str(&format!("-r{rev}"));
-				}
-
-				version
-			},
-		)
-		.parse_next(input)
+	#[token("-")]
+	Dash,
 }
 
-/// Parse a package specifier
-pub fn package_specifier(input: &mut &str) -> ModalResult<PackageSpecifier> {
-	/*
-	3.2 Version specifications
-	The package manager must neither impose fixed limits upon the number of version components, nor upon the length of any component. Package managers should indicate or reject any version that is invalid according to the rules below.
-	A version starts with the number part, which is in the form [0-9]+(\.[0-9]+)* (an unsigned integer, followed by zero or more dot-prefixed unsigned integers).
-	This may optionally be followed by one of [a-z] (a lower-case letter).
-	This may be followed by zero or more of the suffixes _alpha, _beta, _pre, _rc or _p, each of which may optionally be followed by an unsigned integer. Suffix and integer count as separate version components.
-	This may optionally be followed by the suffix -r followed immediately by an unsigned integer (the “revision number”). If this suffix is not present, it is assumed to be -r0.
-	*/
+pub fn parse_package_specifier(
+	input: &str,
+) -> Result<PackageSpecifier, Vec<(Span, String)>> {
+	let mut lexer = SpecToken::lexer(input).spanned();
+	let tokens: Vec<(SpecToken, std::ops::Range<usize>)> = lexer
+		.by_ref()
+		.filter_map(|(tok_res, span)| tok_res.ok().map(|tok| (tok, span)))
+		.collect();
+	let mut errors = Vec::new();
+	let mut idx = 0;
 
-	// A package specifier is in the form <category>/<name>[-<version>]
-	// where <category> is a sequence of alphanumeric characters and underscores, <name> is a sequence of alphanumeric characters and underscores, and <version> is an optional version string.
-	(
-		opt(alt((">", "<", ">=", "<=", "=", "==", "~=")))
-			.context(StrContext::Label("version selector"))
-			.map(|s: Option<&str>| s.map(|s| s.to_string())),
-		(
-			take_while(1.., |c: char| {
-				c.is_ascii_alphanumeric()
-					|| c == '.' || c == '_'
-					|| c == '-' || c == '+'
-			})
-			.context(StrContext::Label("name")),
-			opt(take_while(0.., |c: char| c == '-' || c == '+')
-				.context(StrContext::Label("name suffix"))),
-		)
-			.map(|(name, suffix): (&str, Option<&str>)| {
-				let mut name = name.to_string();
-				if let Some(suffix) = suffix {
-					name.push_str(suffix);
+	let peek = |i: usize, tokens: &Vec<(SpecToken, std::ops::Range<usize>)>| {
+		tokens.get(i).map(|(tok, _)| *tok)
+	};
+
+	// Parse optional version selector
+	let version_selector = match peek(idx, &tokens) {
+		Some(
+			SpecToken::Ge
+			| SpecToken::Le
+			| SpecToken::Gt
+			| SpecToken::Lt
+			| SpecToken::Eq
+			| SpecToken::EqEq
+			| SpecToken::TildeEq,
+		) => {
+			let (tok, span) = &tokens[idx];
+			let s = match tok {
+				SpecToken::Ge => ">=",
+				SpecToken::Le => "<=",
+				SpecToken::Gt => ">",
+				SpecToken::Lt => "<",
+				SpecToken::Eq => "=",
+				SpecToken::EqEq => "==",
+				SpecToken::TildeEq => "~=",
+				_ => unreachable!(),
+			};
+			let span = Span {
+				start: span.start,
+				end: span.end,
+			};
+			idx += 1;
+			Some((s.to_string(), span))
+		}
+		_ => None,
+	};
+
+	// Parse category
+	let category = match peek(idx, &tokens) {
+		Some(SpecToken::Ident) => {
+			let (_tok, span) = &tokens[idx];
+			let s = &input[span.clone()];
+			let span = Span {
+				start: span.start,
+				end: span.end,
+			};
+			idx += 1;
+			(s.to_string(), span)
+		}
+		Some(tok) => {
+			let (_, span) = &tokens[idx];
+			errors.push((
+				Span {
+					start: span.start,
+					end: span.end,
+				},
+				format!("Expected category, found {tok:?}"),
+			));
+			return Err(errors);
+		}
+		None => {
+			errors.push((
+				Span { start: 0, end: 0 },
+				"Unexpected end, expected category".to_string(),
+			));
+			return Err(errors);
+		}
+	};
+
+	// Parse slash
+	match peek(idx, &tokens) {
+		Some(SpecToken::Slash) => {
+			idx += 1;
+		}
+		Some(tok) => {
+			let (_, span) = &tokens[idx];
+			errors.push((
+				Span {
+					start: span.start,
+					end: span.end,
+				},
+				format!("Expected '/', found {tok:?}"),
+			));
+			return Err(errors);
+		}
+		None => {
+			errors.push((
+				Span { start: 0, end: 0 },
+				"Unexpected end, expected '/'".to_string(),
+			));
+			return Err(errors);
+		}
+	}
+
+	// Parse name
+	let name = match peek(idx, &tokens) {
+		Some(SpecToken::Ident) => {
+			let (_, span) = &tokens[idx];
+			let s = &input[span.clone()];
+			let span = Span {
+				start: span.start,
+				end: span.end,
+			};
+			idx += 1;
+			(s.to_string(), span)
+		}
+		Some(tok) => {
+			let (_, span) = &tokens[idx];
+			errors.push((
+				Span {
+					start: span.start,
+					end: span.end,
+				},
+				format!("Expected name, found {tok:?}"),
+			));
+			return Err(errors);
+		}
+		None => {
+			errors.push((
+				Span { start: 0, end: 0 },
+				"Unexpected end, expected name".to_string(),
+			));
+			return Err(errors);
+		}
+	};
+
+	// Parse optional version
+	let mut version: Option<(String, Span)> = None;
+	if let Some(SpecToken::Dash) = peek(idx, &tokens) {
+		let version_start = tokens[idx].1.start;
+		idx += 1; // consume '-'
+		let mut version_str = String::new();
+		let mut version_end = version_start;
+		while let Some(tok) = peek(idx, &tokens) {
+			match tok {
+				SpecToken::Number
+				| SpecToken::Letter
+				| SpecToken::AlphaSuffix
+				| SpecToken::BetaSuffix
+				| SpecToken::PreSuffix
+				| SpecToken::RcSuffix
+				| SpecToken::PatchSuffix
+				| SpecToken::RevisionPrefix
+				| SpecToken::Dash => {
+					let (_, span) = &tokens[idx];
+					version_str.push_str(&input[span.clone()]);
+					version_end = span.end;
+					idx += 1;
 				}
-				name
-			})
-			.context(StrContext::Label("category")),
-		"/",
-		// alpha-numeric characters, underscores, hyphens, and pluses, but only hyphens or plususes in the middle
-		(
-			take_while(1.., |c: char| {
-				c.is_ascii_alphanumeric()
-					|| c == '.' || c == '_'
-					|| c == '-' || c == '+'
-			})
-			.context(StrContext::Label("name")),
-			opt(take_while(0.., |c: char| c == '-' || c == '+')
-				.context(StrContext::Label("name suffix"))),
-		)
-			.map(|(name, suffix): (&str, Option<&str>)| {
-				let mut name = name.to_string();
-				if let Some(suffix) = suffix {
-					name.push_str(suffix);
-				}
-				name
-			})
-			.context(StrContext::Label("name")),
-		opt(("-", package_version))
-			.context(StrContext::Label("version"))
-			.map(|v| v.map(|(_, ver)| ver)),
-	)
-		.map(|(version_selector, category, _, name, version)| {
-			PackageSpecifier {
-				version_selector,
-				category: category.to_string(),
-				name: name.to_string(),
-				version,
+				_ => break,
 			}
+		}
+
+		if !version_str.is_empty() {
+			version = Some((
+				version_str,
+				Span {
+					start: version_start,
+					end: version_end,
+				},
+			));
+		}
+	}
+	if errors.is_empty() {
+		Ok(PackageSpecifier {
+			version_selector,
+			category,
+			name,
+			version,
 		})
-		.parse_next(input)
+	} else {
+		Err(errors)
+	}
 }
